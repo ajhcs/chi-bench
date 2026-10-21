@@ -28,8 +28,10 @@ import logging
 import os
 import re
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -496,11 +498,11 @@ def _extract_usage(raw_responses: list[Any]) -> tuple[int, int, int]:
 def write_result(
     *,
     logs_dir: Path,
-    input_tokens: int,
-    output_tokens: int,
-    cached_tokens: int,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    cached_tokens: int | None,
     cost_usd: float | None,
-    turns: int,
+    turns: int | None,
     final_output: str | None,
     model: str,
     error: str | None,
@@ -515,6 +517,8 @@ def write_result(
         "final_output": final_output,
         "model": model,
         "error": error,
+        "usage_status": "complete" if input_tokens is not None else "unknown",
+        "cost_status": "estimated" if cost_usd is not None else "unknown",
     }
     (logs_dir / "run_result.json").write_text(json.dumps(result, indent=2))
 
@@ -564,7 +568,49 @@ def _should_replay_same_model_reasoning_content(context: Any) -> bool:
 
 
 @asynccontextmanager
-async def _agent_model_context(model: str, api_mode: str):
+async def _agent_model_context(model: str, api_mode: str, *, ledger=None, persist=None):
+    if ledger is not None:
+        from agents.models.interface import Model
+        from agents.models.openai_responses import OpenAIResponsesModel
+        from openai import AsyncOpenAI
+
+        class BudgetedResponses(Model):
+            async def get_response(self, *args, **kwargs):
+                record, limit = ledger.admit()
+                persist()
+                started = time.monotonic()
+                try:
+                    positional = list(args)
+                    settings = kwargs.get("model_settings")
+                    if settings is None:
+                        settings = positional[2]
+                    settings = replace(
+                        settings, max_tokens=limit, temperature=None, top_p=None,
+                        reasoning={"effort": ledger.contract.effort, "mode": ledger.contract.mode},
+                    )
+                    if "model_settings" in kwargs:
+                        kwargs["model_settings"] = settings
+                    else:
+                        positional[2] = settings
+                    response = await delegate.get_response(*positional, **kwargs)
+                    ledger.observe(record, response)
+                    return response
+                except BaseException as exc:
+                    if record["status"] == "pending":
+                        record.update(status="error_usage_unknown", error_type=type(exc).__name__)
+                    raise
+                finally:
+                    record["latency_seconds"] = time.monotonic() - started
+                    persist()
+
+            async def stream_response(self, *args, **kwargs):
+                raise RuntimeError("Streaming is outside the bounded Luna contract")
+                yield  # pragma: no cover
+
+        async with AsyncOpenAI(base_url="https://api.openai.com/v1", max_retries=0) as client:
+            delegate = OpenAIResponsesModel(model=model, openai_client=client)
+            yield BudgetedResponses()
+        return
     if not _is_tinker_chat_route(api_mode):
         yield model
         return
@@ -635,118 +681,99 @@ def _build_model_settings(
 
 
 async def run_agent(instruction: str, mcp_url: str, logs_dir: Path = DEFAULT_LOGS_DIR) -> None:
-    """Create an Agent connected to the chi_bench MCP server and run the task."""
-    from agents import Agent, MultiProvider, RunConfig, Runner, set_tracing_disabled
-    from agents.mcp import MCPServerStreamableHttp
-
-    from chi_bench.experiment.agents.openai_agents_local_tools import build_local_tools
-
-    set_tracing_disabled(True)
-
+    """Run one task; preserve observed usage and mark ambiguous failures unknown."""
     model = os.environ.get("OPENAI_AGENTS_MODEL", "gpt-4.1")
     max_turns = int(os.environ.get("OPENAI_AGENTS_MAX_TURNS", "50"))
     api_mode = os.environ.get("OPENAI_AGENTS_API_MODE", "responses")
     reasoning_effort = os.environ.get("OPENAI_AGENTS_REASONING_EFFORT")
-    is_tinker_chat = _is_tinker_chat_route(api_mode)
+    ledger = None
+    result = None
+    error = None
+    final_output = None
+    input_tokens = output_tokens = cached_tokens = None
+    turns = None
+    cost_usd = None
+    logs_dir.mkdir(parents=True, exist_ok=True)
 
-    _install_oversize_output_patch(logs_dir)
-    _install_mcp_tool_name_sanitizer()
-    local_tools = build_local_tools(logs_dir)
+    def persist():
+        if ledger is not None:
+            destination = logs_dir / "luna_usage.json"
+            temporary = destination.with_suffix(".tmp")
+            temporary.write_text(json.dumps(ledger.snapshot(), indent=2))
+            temporary.replace(destination)
 
-    # Allow vendor-prefixed model ids (anthropic/..., google/..., x-ai/...,
-    # deepseek/...) to fall through to the OpenAI provider with the original
-    # full model id intact, so OpenRouter (and any other OpenAI-compatible
-    # passthrough) routes them correctly. Without this, the SDK's default
-    # MultiProvider raises ``UserError: Unknown prefix: anthropic`` on the
-    # first turn. The OpenAI provider itself uses OPENAI_BASE_URL +
-    # OPENAI_API_KEY, so OpenRouter just needs those env vars set.
-    run_config = RunConfig(
-        model_provider=MultiProvider(
-            unknown_prefix_mode="model_id",
-            openai_use_responses=api_mode == "responses",
-        )
-    )
+    try:
+        if model in {"gpt-6-luna", "openai/gpt-6-luna"}:
+            from chi_bench.experiment.agents.luna_contract import LunaContract, LunaLedger
 
-    async with (
-        MCPServerStreamableHttp(
-            name="chi_bench",
-            params={"url": mcp_url},
-            cache_tools_list=True,
-        ) as mcp_server,
-        _agent_model_context(model, api_mode) as agent_model,
-    ):
-        agent = Agent(
-            name="chi_bench-agent",
-            instructions=SYSTEM_PROMPT,
-            mcp_servers=[mcp_server],
-            tools=local_tools,
-            model=agent_model,
-            model_settings=_build_model_settings(
-                reasoning_effort,
-                separate_reasoning=is_tinker_chat,
-            ),
-        )
+            ledger = LunaLedger(LunaContract.from_env(os.environ))
+            persist()
+        from agents import Agent, MultiProvider, RunConfig, Runner, set_tracing_disabled
+        from agents.mcp import MCPServerStreamableHttp
 
-        print(f"Running agent with model={model}, max_turns={max_turns}")
-        print(f"MCP server: {mcp_url}")
-        print(f"Instruction length: {len(instruction)} chars")
-        print("---")
+        from chi_bench.experiment.agents.openai_agents_local_tools import build_local_tools
 
-        error: str | None = None
-        final_output: str | None = None
-        input_tokens = 0
-        output_tokens = 0
-        cached_tokens = 0
-        turns = 0
-        result = None
-
-        try:
-            result = await Runner.run(
-                starting_agent=agent,
-                input=instruction,
-                max_turns=max_turns,
-                run_config=run_config,
+        set_tracing_disabled(True)
+        _install_oversize_output_patch(logs_dir)
+        _install_mcp_tool_name_sanitizer()
+        local_tools = build_local_tools(logs_dir)
+        run_config = RunConfig(model_provider=MultiProvider(
+            unknown_prefix_mode="model_id", openai_use_responses=api_mode == "responses",
+        ))
+        async with (
+            MCPServerStreamableHttp(name="chi_bench", params={"url": mcp_url},
+                                   cache_tools_list=True) as mcp_server,
+            _agent_model_context(model, api_mode, ledger=ledger, persist=persist) as agent_model,
+        ):
+            agent = Agent(
+                name="chi_bench-agent", instructions=SYSTEM_PROMPT,
+                mcp_servers=[mcp_server], tools=local_tools, model=agent_model,
+                model_settings=_build_model_settings(
+                    reasoning_effort, separate_reasoning=_is_tinker_chat_route(api_mode),
+                ),
             )
+            result = await Runner.run(starting_agent=agent, input=instruction,
+                                      max_turns=max_turns, run_config=run_config)
             final_output = str(result.final_output) if result.final_output else None
-            input_tokens, output_tokens, cached_tokens = _extract_usage(result.raw_responses)
             turns = len(result.raw_responses)
-
-            print("---")
-            print(f"Agent finished. Turns: {turns}")
-            if final_output:
-                print(f"Final output:\n{final_output}")
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            print(f"Agent error: {error}", file=sys.stderr)
-
-        cost_usd = _compute_cost(model, input_tokens, output_tokens)
-
-        write_result(
-            logs_dir=logs_dir,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cached_tokens=cached_tokens,
-            cost_usd=cost_usd,
-            turns=turns,
-            final_output=final_output,
-            model=model,
-            error=error,
-        )
+            # Missing usage is unknown, never silently counted as zero.
+            if all(
+                type(getattr(getattr(r, "usage", None), key, None)) is int
+                for r in result.raw_responses for key in ("input_tokens", "output_tokens")
+            ):
+                input_tokens, output_tokens, cached_tokens = _extract_usage(result.raw_responses)
+                if ledger is None:
+                    cost_usd = _compute_cost(model, input_tokens, output_tokens)
+    except BaseException as exc:
+        # Exception text can contain request bodies or credentials. Record class only.
+        error = type(exc).__name__
+        print(f"Agent error: {error}", file=sys.stderr)
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+    finally:
+        if ledger is not None:
+            persist()
+            if ledger.complete:
+                input_tokens, output_tokens, cached_tokens = (
+                    ledger.input_tokens, ledger.output_tokens, ledger.cached_tokens,
+                )
+            turns = len(ledger.requests)
+        write_result(logs_dir=logs_dir, input_tokens=input_tokens, output_tokens=output_tokens,
+                     cached_tokens=cached_tokens, cost_usd=cost_usd, turns=turns,
+                     final_output=final_output, model=model, error=error)
         if final_output:
             (logs_dir / "run_output.txt").write_text(final_output)
+        trace_result = result
+        if trace_result is None and ledger is not None and ledger.raw_responses:
+            from types import SimpleNamespace
 
-        if result is not None:
+            trace_result = SimpleNamespace(raw_responses=ledger.raw_responses, new_items=[])
+        if trace_result is not None:
             try:
-                _dump_trace(
-                    trace_path=logs_dir / "trace.jsonl",
-                    instruction=instruction,
-                    system_prompt=SYSTEM_PROMPT,
-                    result=result,
-                    model=model,
-                )
+                _dump_trace(trace_path=logs_dir / "trace.jsonl", instruction=instruction,
+                            system_prompt=SYSTEM_PROMPT, result=trace_result, model=model)
             except Exception as exc:
-                logger.warning("Failed to dump conversation trace: %s", exc)
-
+                logger.warning("Trace unavailable: %s", type(exc).__name__)
     if error:
         sys.exit(1)
 

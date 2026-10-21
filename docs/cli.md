@@ -427,3 +427,8 @@ API keys and tokens are read from process env (or `run.env_file` for `cb submiss
 | `CHI_BENCH_PAYER_MODE` | Auto-set to `agent` by `cb serve` if unset; controls the in-container payer routing. |
 
 Provide whichever subset matches the rows you intend to run.
+
+## Luna agent kwargs
+
+The OpenAI Agents harness adds explicit effort/mode and budget kwargs for Luna.
+See [the Luna contract](luna-contract.md) for required fields and pending validation.

@@ -1062,6 +1062,7 @@ def collect_all_verifier_checks(
                         "rubrics": list(judge_input.rubrics),
                         "session_metadata": judge_output.session_metadata,
                         "judge_unavailable_reason": judge_output.judge_unavailable_reason,
+                        "degraded_rubric_ids": list(judge_output.degraded_rubric_ids),
                     }
 
         if _should_merge_legacy(expectations):
@@ -1429,11 +1430,13 @@ def _run_cm_verifier(
         "judge_unavailable_reason": judge_unavailable_reason,
     }
 
+    apply_judge_validity(scorecard, rubric_payload)
+
     return VerifyResult(
         # VerifyResult.reward is the binary axis (Harbor pass-rate semantic).
         # Fractional axis lives on scorecard["fractional_reward"] for callers
         # that want partial-credit / progress-tracking signal.
-        reward=reward.binary,
+        reward=scorecard["binary_reward"],
         scorecard=scorecard,
         stage_results=[],
         rubric=rubric_payload,
@@ -1473,12 +1476,43 @@ def verify_task(
         instruction_text=instruction_text,
     )
     scorecard = build_scorecard(flat_checks, stage_results=stage_results or None)
+    apply_judge_validity(scorecard, semantic_rubric)
     return VerifyResult(
         reward=float(scorecard["binary_reward"]),
         scorecard=scorecard,
         stage_results=list(stage_results or []),
         rubric=semantic_rubric or {},
     )
+
+
+def apply_judge_validity(scorecard: dict[str, Any], rubric: dict[str, Any]) -> None:
+    """Keep invalid grading separate from an agent failure and legitimate E2E NA."""
+    intentional_skip = rubric.get("session_metadata", {}).get("skipped") == "no_submit_e2e_path"
+    checks = scorecard.get("checks", {})
+    expected = rubric.get("rubrics", rubric.get("cm_rubric", []))
+    missing = []
+    if not intentional_skip:
+        for item in expected:
+            rid = item.get("rubric_id")
+            if rid and not any(
+                checks.get(f"{prefix}.{rid}") is True or checks.get(f"{prefix}.{rid}") is False
+                for prefix in ("judge", "cm_rubric")
+            ):
+                missing.append(rid)
+    reason = rubric.get("judge_unavailable_reason")
+    invalid = not intentional_skip and bool(reason or missing or rubric.get("degraded_rubric_ids"))
+    scorecard.update(
+        evaluation_validity="invalid" if invalid else "valid",
+        invalidity_reason=(reason or "missing_or_degraded_required_rubrics") if invalid else None,
+        missing_required_judge_rubrics=missing,
+        upstream_binary_reward=scorecard["binary_reward"],
+    )
+    if invalid:
+        # Harbor needs a numeric scalar. Never publish an invalid positive reward.
+        # evaluation_validity distinguishes this sentinel from agent failure.
+        scorecard["binary_reward"] = 0.0
+        if "reward" in scorecard:
+            scorecard["reward"] = 0.0
 
 
 def build_scorecard(
@@ -1537,7 +1571,10 @@ def write_verifier_outputs(
     scorecard_path.parent.mkdir(parents=True, exist_ok=True)
     exported_state_path.parent.mkdir(parents=True, exist_ok=True)
     verifier_context_path.parent.mkdir(parents=True, exist_ok=True)
-    reward_path.write_text(json.dumps({"reward": scorecard["binary_reward"]}))
+    reward_path.write_text(json.dumps({
+        "reward": scorecard["binary_reward"],
+        "evaluation_validity": scorecard.get("evaluation_validity", "unverified"),
+    }))
     scorecard_path.write_text(json.dumps(scorecard, indent=2))
     exported_state_path.write_text(json.dumps(exported, indent=2))
     verifier_context_path.write_text(
@@ -1697,6 +1734,8 @@ def run_verifier(
                 indent=2,
             )
         )
+        if verify_result.scorecard.get("evaluation_validity") == "invalid":
+            return 2
         # Harbor reads the scalar reward — any non-1.0 value surfaces as a
         # failing exit code so run logs are noisy on regressions.
         if verify_result.reward < 1.0:
@@ -1715,6 +1754,7 @@ def run_verifier(
         instruction_text=instruction_text,
     )
     scorecard = build_scorecard(flat_checks, stage_results=stage_results or None)
+    apply_judge_validity(scorecard, semantic_rubric)
     write_verifier_outputs(
         scorecard,
         expectations,
@@ -1725,6 +1765,8 @@ def run_verifier(
         exported_state_path=exported_state_path,
         verifier_context_path=verifier_context_path,
     )
+    if scorecard.get("evaluation_validity") == "invalid":
+        return 2
     if scorecard["binary_reward"] != 1.0:
         print(json.dumps(scorecard, indent=2))
         return 1

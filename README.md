@@ -295,3 +295,6 @@ If you use $\chi$-Bench, please cite:
 ## License
 
 Code: Apache-2.0 (see [`LICENSE`](LICENSE)). Data licensing on the [HF dataset card](https://huggingface.co/datasets/actava/chi-bench).
+
+Luna Medium/Max source preparation and its unexecuted validation gates are documented in
+[`docs/luna-contract.md`](docs/luna-contract.md).

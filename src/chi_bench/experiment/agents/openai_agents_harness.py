@@ -91,8 +91,39 @@ class OpenAIAgentsHarness(BaseInstalledAgent):
             "reasoning_effort",
             cli="--reasoning-effort",
             type="enum",
-            choices=["none", "minimal", "low", "medium", "high", "xhigh"],
+            choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
             env_fallback="OPENAI_AGENTS_REASONING_EFFORT",
+        ),
+        CliFlag(
+            "reasoning_mode",
+            cli="--reasoning-mode",
+            type="enum",
+            choices=["standard", "pro"],
+            env_fallback="OPENAI_AGENTS_REASONING_MODE",
+        ),
+        CliFlag(
+            "max_output_tokens",
+            cli="--max-output-tokens",
+            type="int",
+            env_fallback="OPENAI_AGENTS_MAX_OUTPUT_TOKENS",
+        ),
+        CliFlag(
+            "max_total_output_tokens",
+            cli="--max-total-output-tokens",
+            type="int",
+            env_fallback="OPENAI_AGENTS_MAX_TOTAL_OUTPUT_TOKENS",
+        ),
+        CliFlag(
+            "max_model_calls",
+            cli="--max-model-calls",
+            type="int",
+            env_fallback="OPENAI_AGENTS_MAX_MODEL_CALLS",
+        ),
+        CliFlag(
+            "max_total_tokens",
+            cli="--max-total-tokens",
+            type="int",
+            env_fallback="OPENAI_AGENTS_MAX_TOTAL_TOKENS",
         ),
     ]
 
@@ -134,6 +165,16 @@ class OpenAIAgentsHarness(BaseInstalledAgent):
           ``OPENROUTER_API_KEY`` is not set.
         """
         env: dict[str, str] = {}
+        if model_name in {"gpt-6-luna", "openai/gpt-6-luna"}:
+            from chi_bench.experiment.agents.luna_contract import LUNA_ENDPOINT
+
+            endpoint = host_env.get("OPENAI_BASE_URL", LUNA_ENDPOINT).rstrip("/")
+            if endpoint != LUNA_ENDPOINT or provider_route not in (None, "auto"):
+                raise RuntimeError("Luna evaluation forbids provider/endpoint substitution")
+            env.update(OPENAI_BASE_URL=LUNA_ENDPOINT, OPENAI_AGENTS_MODEL="gpt-6-luna")
+            if key := host_env.get("OPENAI_API_KEY"):
+                env["OPENAI_API_KEY"] = key
+            return env
         if model_name is None:
             if val := host_env.get("OPENAI_API_KEY"):
                 env["OPENAI_API_KEY"] = val
@@ -247,6 +288,10 @@ class OpenAIAgentsHarness(BaseInstalledAgent):
         # would then 401. Save & restore around the exec so repeated run()
         # calls (retry paths, test setups) still see the original extras.
         saved_extra_env = self._extra_env
+        if self.model_name in {"gpt-6-luna", "openai/gpt-6-luna"}:
+            override = saved_extra_env.get("OPENAI_BASE_URL")
+            if override is not None and override.rstrip("/") != self.OPENAI_DIRECT_BASE_URL:
+                raise RuntimeError("Luna evaluation forbids agent-scoped endpoint substitution")
         self._extra_env = {
             k: v
             for k, v in saved_extra_env.items()
@@ -275,6 +320,21 @@ class OpenAIAgentsHarness(BaseInstalledAgent):
                 env["OPENAI_AGENTS_API_MODE"] = api_mode
             if reasoning_effort := self._resolved_flags.get("reasoning_effort"):
                 env["OPENAI_AGENTS_REASONING_EFFORT"] = reasoning_effort
+
+            for flag in (
+                "reasoning_mode", "max_output_tokens", "max_total_output_tokens",
+                "max_model_calls", "max_total_tokens",
+            ):
+                if (value := self._resolved_flags.get(flag)) is not None:
+                    env[f"OPENAI_AGENTS_{flag.upper()}"] = str(value)
+            if env.get("OPENAI_AGENTS_MODEL") == "gpt-6-luna":
+                from chi_bench.experiment.agents.luna_contract import LunaContract
+
+                # Harbor extras override exec env. Reject conflicting route/contract values.
+                for key, value in self._extra_env.items():
+                    if key.startswith("OPENAI_AGENTS_") and key in env and str(value) != env[key]:
+                        raise RuntimeError(f"Conflicting Luna contract override: {key}")
+                LunaContract.from_env(env)
 
             escaped = shlex.quote(instruction)
             await self.exec_as_agent(

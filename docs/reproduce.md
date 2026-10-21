@@ -61,3 +61,7 @@ python scripts/aggregate.py --trials-dir logs/experiments/table5_mcp_vs_cli --ou
 - `--agent <name>` — run only rows with this harness.
 - `--domain pa_provider | pa_um | cm` — restrict to one domain.
 - `--condition <name>` (table4, table5) — restrict to one ablation cell.
+
+New invalid-judge evidence blocks aggregation until rejudging. Unknown accounting
+produces a null mean cost and `n_unknown_cost_trials`; report cost coverage apart
+from valid outcomes. See [the Luna contract](luna-contract.md) for limitations.
