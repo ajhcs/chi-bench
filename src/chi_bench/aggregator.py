@@ -71,6 +71,7 @@ class Trial:
     output_tokens: int
     cache_tokens: int
     wall_clock_seconds: float
+    usage_complete: bool = True
 
 
 def is_per_trial_result(path: Path) -> bool:
@@ -94,6 +95,19 @@ def _parse_trial(result_path: Path) -> Trial | None:
     vr = data.get("verifier_result")
     if not isinstance(vr, dict):
         return None
+    # The numeric Harbor sentinel cannot distinguish an outage from agent failure.
+    score_path = result_path.parent / "verifier" / "scorecard.json"
+    if score_path.exists():
+        score = json.loads(score_path.read_text())
+        if score.get("evaluation_validity") == "invalid":
+            raise ValueError("Invalid judge evidence: rejudge before aggregating this run")
+    accounting_complete = True
+    for filename in ("run_result.json", "luna_usage.json"):
+        evidence = result_path.parent / "agent" / filename
+        if evidence.exists():
+            accounting = json.loads(evidence.read_text())
+            if accounting.get("usage_status") == "unknown":
+                accounting_complete = False
     rb = vr.get("rewards")
     reward_value = rb.get("reward") if isinstance(rb, dict) else vr.get("reward")
     try:
@@ -164,6 +178,7 @@ def _parse_trial(result_path: Path) -> Trial | None:
         output_tokens=usage("n_output_tokens", "output_tokens"),
         cache_tokens=usage("n_cache_tokens", "cache_tokens"),
         wall_clock_seconds=wall_clock_seconds,
+        usage_complete=accounting_complete,
     )
 
 
@@ -173,8 +188,14 @@ def _load_prices(path: Path | None) -> dict[str, dict[str, float]]:
     return yaml.safe_load(path.read_text()).get("prices", {})
 
 
-def _cost(trial: Trial, prices: dict[str, dict[str, float]]) -> float:
+def _cost(trial: Trial, prices: dict[str, dict[str, float]]) -> float | None:
+    if not trial.usage_complete:
+        return None
     p = prices.get(trial.model) or {}
+    if trial.model in {"openai/gpt-6-luna", "gpt-6-luna"}:
+        # A priced estimate needs a reviewed rate and complete cache accounting.
+        # The Luna ledger is the authority; do not price unknown detail as zero.
+        return None
     inp = p.get("input", 0.0)
     out = p.get("output", 0.0)
     cache = p.get("cache", inp * 0.1)
@@ -256,7 +277,9 @@ def aggregate_to_rows(
             pp3_vec, iters=bootstrap_iters, seed=bootstrap_seed
         )
 
-        total_cost = sum(_cost(x, prices) for x in gs)
+        costs = [_cost(x, prices) for x in gs]
+        unknown_costs = sum(cost is None for cost in costs)
+        total_cost = sum(cost for cost in costs if cost is not None)
         mean_walltime = sum(x.wall_clock_seconds for x in gs) / max(1, n1)
 
         rows.append(
@@ -274,7 +297,8 @@ def aggregate_to_rows(
                 "pass_pow_3": passpow3_mean,
                 "pass_pow_3_lo": passpow3_lo,
                 "pass_pow_3_hi": passpow3_hi,
-                "mean_cost_usd": total_cost / max(1, n1),
+                "mean_cost_usd": None if unknown_costs else total_cost / max(1, n1),
+                "n_unknown_cost_trials": unknown_costs,
                 "mean_walltime_s": mean_walltime,
             }
         )

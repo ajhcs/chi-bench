@@ -51,3 +51,11 @@ This re-invokes only the judge against existing workspaces — useful
 when the judge prompt is tuned mid-experiment.
 
 Full flag-by-flag reference: [`docs/cli.md`](cli.md#cb-experiment-rejudge).
+
+## Required-judge invalidity
+
+Missing required rubric verdicts and judge outages invalidate evaluation. The
+scorecard preserves `upstream_binary_reward`, marks `evaluation_validity: invalid`,
+and writes reward zero as a Harbor sentinel; verifier exit code 2 distinguishes
+invalid grading from an agent failure. Aggregation refuses invalid judge evidence.
+Intentional E2E no-submit skips remain NA. See [the Luna contract](luna-contract.md).

@@ -367,3 +367,43 @@ async def test_routing_failure_restores_original_extra_env(
         "OPENAI_BASE_URL": "https://example.invalid/v1",
         "KEEP_ME": "test-value",
     }
+
+
+@pytest.mark.parametrize("model", ["gpt-6-luna", "openai/gpt-6-luna"])
+def test_luna_direct_routing_strips_only_declared_vendor_prefix(model):
+    routed = OpenAIAgentsHarness._resolve_routing(model, {})
+    assert routed["OPENAI_AGENTS_MODEL"] == "gpt-6-luna"
+    assert routed["OPENAI_BASE_URL"] == "https://api.openai.com/v1"
+    with pytest.raises(RuntimeError):
+        OpenAIAgentsHarness._resolve_routing(model, {"OPENAI_BASE_URL": "https://example.invalid"})
+    with pytest.raises(RuntimeError):
+        OpenAIAgentsHarness._resolve_routing(model, {}, provider_route="tinker")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("effort", ["medium", "max"])
+async def test_luna_harness_forwards_explicit_complete_contract(tmp_path, monkeypatch, effort):
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    harness = OpenAIAgentsHarness(
+        logs_dir=tmp_path, model_name="openai/gpt-6-luna",
+        mcp_servers=[MCPServerConfig(name="chi_bench", transport="streamable-http",
+                                    url="http://example.invalid/mcp")],
+        api_mode="responses", reasoning_effort=effort, reasoning_mode="standard",
+        max_retries=0, max_output_tokens=8, max_total_output_tokens=10,
+        max_total_input_tokens=2100000, max_model_calls=2, max_total_tokens=2100010,
+    )
+    captured = {}
+
+    async def fake_exec(environment, *, command, env):
+        captured.update(env)
+
+    monkeypatch.setattr(harness, "exec_as_agent", fake_exec)
+    await harness.run("synthetic", object(), AgentContext())
+    assert captured["OPENAI_AGENTS_REASONING_EFFORT"] == effort
+    assert captured["OPENAI_AGENTS_REASONING_MODE"] == "standard"
+    assert captured["OPENAI_AGENTS_MAX_OUTPUT_TOKENS"] == "8"
+    assert captured["OPENAI_AGENTS_MAX_TOTAL_OUTPUT_TOKENS"] == "10"
+    assert captured["OPENAI_AGENTS_MAX_MODEL_CALLS"] == "2"
+    assert captured["OPENAI_AGENTS_MAX_TOTAL_TOKENS"] == "2100010"
+    assert captured["OPENAI_AGENTS_MAX_TOTAL_INPUT_TOKENS"] == "2100000"
+    assert captured["OPENAI_AGENTS_MAX_RETRIES"] == "0"

@@ -57,3 +57,6 @@ delivers the denial letter. Clinical review is not required for this result.
 
 The verifier always uses `claude-opus-4-7` (configurable but paper-faithful default).
 See `docs/judge.md`.
+
+The opt-in Luna route wraps Responses requests with an accounting journal and
+output/call admission guards; see [the Luna contract](luna-contract.md).
