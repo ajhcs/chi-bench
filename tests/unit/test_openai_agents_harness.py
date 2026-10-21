@@ -390,7 +390,7 @@ async def test_luna_harness_forwards_explicit_complete_contract(tmp_path, monkey
                                     url="http://example.invalid/mcp")],
         api_mode="responses", reasoning_effort=effort, reasoning_mode="standard",
         max_retries=0, max_output_tokens=8, max_total_output_tokens=10,
-        max_model_calls=2, max_total_tokens=100,
+        max_total_input_tokens=2100000, max_model_calls=2, max_total_tokens=2100010,
     )
     captured = {}
 
@@ -404,5 +404,6 @@ async def test_luna_harness_forwards_explicit_complete_contract(tmp_path, monkey
     assert captured["OPENAI_AGENTS_MAX_OUTPUT_TOKENS"] == "8"
     assert captured["OPENAI_AGENTS_MAX_TOTAL_OUTPUT_TOKENS"] == "10"
     assert captured["OPENAI_AGENTS_MAX_MODEL_CALLS"] == "2"
-    assert captured["OPENAI_AGENTS_MAX_TOTAL_TOKENS"] == "100"
+    assert captured["OPENAI_AGENTS_MAX_TOTAL_TOKENS"] == "2100010"
+    assert captured["OPENAI_AGENTS_MAX_TOTAL_INPUT_TOKENS"] == "2100000"
     assert captured["OPENAI_AGENTS_MAX_RETRIES"] == "0"

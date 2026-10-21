@@ -114,6 +114,12 @@ class OpenAIAgentsHarness(BaseInstalledAgent):
             env_fallback="OPENAI_AGENTS_MAX_TOTAL_OUTPUT_TOKENS",
         ),
         CliFlag(
+            "max_total_input_tokens",
+            cli="--max-total-input-tokens",
+            type="int",
+            env_fallback="OPENAI_AGENTS_MAX_TOTAL_INPUT_TOKENS",
+        ),
+        CliFlag(
             "max_model_calls",
             cli="--max-model-calls",
             type="int",
@@ -323,7 +329,7 @@ class OpenAIAgentsHarness(BaseInstalledAgent):
 
             for flag in (
                 "reasoning_mode", "max_output_tokens", "max_total_output_tokens",
-                "max_model_calls", "max_total_tokens",
+                "max_total_input_tokens", "max_model_calls", "max_total_tokens",
             ):
                 if (value := self._resolved_flags.get(flag)) is not None:
                     env[f"OPENAI_AGENTS_{flag.upper()}"] = str(value)

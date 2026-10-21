@@ -28,10 +28,8 @@ import logging
 import os
 import re
 import sys
-import time
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -570,46 +568,28 @@ def _should_replay_same_model_reasoning_content(context: Any) -> bool:
 @asynccontextmanager
 async def _agent_model_context(model: str, api_mode: str, *, ledger=None, persist=None):
     if ledger is not None:
-        from agents.models.interface import Model
         from agents.models.openai_responses import OpenAIResponsesModel
         from openai import AsyncOpenAI
 
-        class BudgetedResponses(Model):
-            async def get_response(self, *args, **kwargs):
-                record, limit = ledger.admit()
-                persist()
-                started = time.monotonic()
-                try:
-                    positional = list(args)
-                    settings = kwargs.get("model_settings")
-                    if settings is None:
-                        settings = positional[2]
-                    settings = replace(
-                        settings, max_tokens=limit, temperature=None, top_p=None,
-                        reasoning={"effort": ledger.contract.effort, "mode": ledger.contract.mode},
-                    )
-                    if "model_settings" in kwargs:
-                        kwargs["model_settings"] = settings
-                    else:
-                        positional[2] = settings
-                    response = await delegate.get_response(*positional, **kwargs)
-                    ledger.observe(record, response)
-                    return response
-                except BaseException as exc:
-                    if record["status"] == "pending":
-                        record.update(status="error_usage_unknown", error_type=type(exc).__name__)
-                    raise
-                finally:
-                    record["latency_seconds"] = time.monotonic() - started
-                    persist()
+        from chi_bench.experiment.agents.luna_contract import LunaContractError, LunaResponsesBoundary
 
-            async def stream_response(self, *args, **kwargs):
-                raise RuntimeError("Streaming is outside the bounded Luna contract")
-                yield  # pragma: no cover
+        class ReceiptClient:
+            def __init__(self, client):
+                self.client = client
+                self.responses = LunaResponsesBoundary(client.responses, ledger, persist)
+
+            def with_options(self, **kwargs):
+                # Agents may request a retry-disabled client through this public API.
+                # Preserve the receipt boundary around every derived client.
+                if set(kwargs) != {"max_retries"} or kwargs["max_retries"] != 0:
+                    raise LunaContractError("Unsupported client options for bounded Luna")
+                return ReceiptClient(self.client.with_options(max_retries=0))
+
+            def __getattr__(self, name):
+                return getattr(self.client, name)
 
         async with AsyncOpenAI(base_url="https://api.openai.com/v1", max_retries=0) as client:
-            delegate = OpenAIResponsesModel(model=model, openai_client=client)
-            yield BudgetedResponses()
+            yield OpenAIResponsesModel(model=model, openai_client=ReceiptClient(client))
         return
     if not _is_tinker_chat_route(api_mode):
         yield model
@@ -699,8 +679,16 @@ async def run_agent(instruction: str, mcp_url: str, logs_dir: Path = DEFAULT_LOG
         if ledger is not None:
             destination = logs_dir / "luna_usage.json"
             temporary = destination.with_suffix(".tmp")
-            temporary.write_text(json.dumps(ledger.snapshot(), indent=2))
+            with temporary.open("w") as stream:
+                stream.write(json.dumps(ledger.snapshot(), indent=2))
+                stream.flush()
+                os.fsync(stream.fileno())
             temporary.replace(destination)
+            directory = os.open(logs_dir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
 
     try:
         if model in {"gpt-6-luna", "openai/gpt-6-luna"}:
